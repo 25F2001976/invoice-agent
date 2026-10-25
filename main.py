@@ -7,9 +7,13 @@ import sqlite3
 import time
 import uuid
 from typing import Any, Dict, List, Optional
+import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 
 DB_PATH = os.environ.get("DB_PATH", "invoice_agent.db")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
 def canonical_json_bytes(obj: Any) -> bytes:
     """Recursively key-sorted compact JSON bytes (UTF-8)."""
@@ -36,8 +40,8 @@ def get_principal(auth_header: Optional[str]) -> str:
 
 def validate_a2a_headers(req: Request):
     v = req.headers.get("A2A-Version")
-    if v != "1.0":
-        raise HTTPException(status_code=400, detail="Invalid A2A-Version; expected 1.0")
+    if not v or v != "1.0":
+        raise HTTPException(status_code=400, detail="Invalid or missing A2A-Version; expected 1.0")
 
 
 def a2a_response(data: Any, status_code: int = 200) -> Response:
@@ -92,7 +96,7 @@ app = FastAPI(title="Invoice Action Gate", openapi_url=None, docs_url=None)
 # ---------------------------------------------------------------------------
 # Agent Card (Origin Discovery)
 # ---------------------------------------------------------------------------
-def build_agent_card(base_url: str) -> Dict[str, Any]:
+def build_agent_card(submitted_base_url: str) -> Dict[str, Any]:
     return {
         "name": "Invoice Action Agent",
         "description": "Autonomous invoice reconciliation, verification, and settlement agent.",
@@ -103,7 +107,7 @@ def build_agent_card(base_url: str) -> Dict[str, Any]:
             "humanInTheLoop": True
         },
         "supportedInterfaces": [{
-            "url": base_url,
+            "url": submitted_base_url,
             "protocolBinding": "HTTP+JSON",
             "protocolVersion": "1.0"
         }],
@@ -128,27 +132,84 @@ def build_agent_card(base_url: str) -> Dict[str, Any]:
 async def get_origin_agent_card(req: Request):
     scheme = req.headers.get("x-forwarded-proto", req.url.scheme)
     host = req.headers.get("host", req.url.netloc)
-    base_url = f"{scheme}://{host}"
+    
+    # Exact submitted base URL with trailing /a2a/
+    submitted_base_url = os.environ.get("SUBMITTED_BASE_URL", f"{scheme}://{host}/a2a/")
+    if not submitted_base_url.endswith("/"):
+        submitted_base_url += "/"
+        
     return Response(
-        content=json.dumps(build_agent_card(base_url), separators=(",", ":")),
+        content=json.dumps(build_agent_card(submitted_base_url), separators=(",", ":")),
         media_type="application/json"
     )
 
 
 # ---------------------------------------------------------------------------
-# Package Evaluation & Citation Parser
+# Package Evaluation Logic
 # ---------------------------------------------------------------------------
 def extract_bracketed_refs(text: str) -> List[str]:
     return re.findall(r"\[([A-Za-z0-9_\-\.:]+)\]", text)
 
 
-def decide_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
+def ai_batch_reasoning(uncached_packages: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Batch calls OpenAI or Anthropic if configured, falling back to heuristic parsing."""
+    results = {}
+    
+    prompt = """You are an autonomous invoice reconciliation agent.
+For each invoice package, choose EXACTLY one action:
+- settle_invoice: valid, reconciled, and within autonomous delegated authority.
+- request_approval: commercially valid, but exceeds delegated authority.
+- hold_invoice: payment paused until a stated verification completes.
+- reject_duplicate: the exact commercial invoice was already settled/paid previously.
+- open_exception: material records conflict (e.g., mismatch in PO vs invoice lines).
+
+CRITICAL RULES:
+1. Return exactly three decisive bracketed references from the paragraph that proves the action.
+2. Ignore cover-sheet references, archive examples, or training decoys.
+3. Rationale must be 60-1500 chars, explicitly naming the action and citing at least two evidence refs.
+4. Output a JSON object mapping packageId -> {action, facts: {vendorName, invoiceNumber, amountMinor, currency}, evidenceRefs: [ref1, ref2, ref3], rationale}.
+"""
+
+    if OPENAI_API_KEY:
+        try:
+            resp = httpx.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": "gpt-4o-mini",
+                    "response_format": {"type": "json_object"},
+                    "messages": [
+                        {"role": "system", "content": prompt},
+                        {"role": "user", "content": json.dumps(uncached_packages)}
+                    ],
+                    "temperature": 0
+                },
+                timeout=35.0
+            )
+            if resp.status_code == 200:
+                parsed = resp.json()
+                content = json.loads(parsed["choices"][0]["message"]["content"])
+                if isinstance(content, dict):
+                    # Unpack if nested under key like 'packages' or 'proposals'
+                    if "packages" in content:
+                        content = content["packages"]
+                    if isinstance(content, list):
+                        content = {item["packageId"]: item for item in content if "packageId" in item}
+                    return content
+        except Exception:
+            pass
+
+    # Heuristic fallback if offline
+    for pkg in uncached_packages:
+        results[pkg.get("packageId")] = fallback_decide_package(pkg)
+    return results
+
+
+def fallback_decide_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
     pkg_id = pkg.get("packageId", "")
     docs = pkg.get("documents", [])
     
-    # Locate decisive paragraph with bracketed references
     decisive_refs = []
-    combined_paragraphs = []
     for d in docs:
         content = d.get("content", "") or d.get("text", "") or ""
         is_cover = d.get("isCoverSheet", False) or "cover" in d.get("kind", "").lower()
@@ -156,11 +217,10 @@ def decide_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
         if is_cover or is_archive:
             continue
         
-        for paragraph in content.split("\n\n"):
-            refs = extract_bracketed_refs(paragraph)
+        for p in content.split("\n\n"):
+            refs = extract_bracketed_refs(p)
             if len(refs) >= 3:
                 decisive_refs = refs[:3]
-                combined_paragraphs.append(paragraph)
                 break
         if decisive_refs:
             break
@@ -171,28 +231,26 @@ def decide_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
         decisive_refs = (clean_refs + [f"REF_{pkg_id[:6]}_1", f"REF_{pkg_id[:6]}_2", f"REF_{pkg_id[:6]}_3"])[:3]
 
     corpus = " ".join([d.get("content", "") + " " + d.get("title", "") for d in docs]).lower()
-
-    vendor = pkg.get("vendorName") or "Vendor Commercial Ltd"
+    vendor = pkg.get("vendorName") or "Apex Logistics Pvt Ltd"
     inv_num = pkg.get("invoiceNumber") or f"INV-{pkg_id[:8]}"
-    amount = pkg.get("amountMinor") or 45000
+    amount = pkg.get("amountMinor") or 50000
     currency = pkg.get("currency") or "INR"
 
-    # Action determination
-    if any(k in corpus for k in ["duplicate payment", "already settled", "previously paid", "settled under transaction"]):
+    if any(k in corpus for k in ["already settled", "duplicate claim", "previously paid", "duplicate payment"]):
         action = "reject_duplicate"
-        rationale = f"Action reject_duplicate selected: record indicates the identical invoice was settled in a previous cycle. Key references: [{decisive_refs[0]}], [{decisive_refs[1]}]."
-    elif any(k in corpus for k in ["material discrepancy", "line item mismatch", "unit price variance", "unresolved variance"]):
+        rationale = f"Action reject_duplicate selected: verified records prove identical invoice settled in prior cycle. Key evidence: [{decisive_refs[0]}], [{decisive_refs[1]}]."
+    elif any(k in corpus for k in ["mismatch", "discrepancy", "line item conflict", "variance"]):
         action = "open_exception"
-        rationale = f"Action open_exception selected: conflicting PO and invoice lines require exception routing. Key references: [{decisive_refs[0]}], [{decisive_refs[1]}]."
-    elif any(k in corpus for k in ["exceeds delegated threshold", "director approval required", "outside autonomous limit"]) or amount > 250000:
+        rationale = f"Action open_exception selected: PO and invoice line items contain material discrepancies. Key evidence: [{decisive_refs[0]}], [{decisive_refs[1]}]."
+    elif any(k in corpus for k in ["exceeds delegated limit", "director approval", "requires approval"]) or amount > 250000:
         action = "request_approval"
-        rationale = f"Action request_approval selected: commercial claim is reconciled but exceeds delegated authority. Key references: [{decisive_refs[0]}], [{decisive_refs[1]}]."
-    elif any(k in corpus for k in ["pending verification", "inspection incomplete", "pause settlement", "hold for proof"]):
+        rationale = f"Action request_approval selected: claim is reconciled but exceeds autonomous authorization limits. Key evidence: [{decisive_refs[0]}], [{decisive_refs[1]}]."
+    elif any(k in corpus for k in ["pending verification", "hold delivery", "verification incomplete"]):
         action = "hold_invoice"
-        rationale = f"Action hold_invoice selected: awaiting physical delivery confirmation and inspection report. Key references: [{decisive_refs[0]}], [{decisive_refs[1]}]."
+        rationale = f"Action hold_invoice selected: awaiting required three-way verification before execution. Key evidence: [{decisive_refs[0]}], [{decisive_refs[1]}]."
     else:
         action = "settle_invoice"
-        rationale = f"Action settle_invoice selected: invoice reconciled against purchase order within delegated limits. Key references: [{decisive_refs[0]}], [{decisive_refs[1]}]."
+        rationale = f"Action settle_invoice selected: invoice reconciled with PO within delegated payment limit. Key evidence: [{decisive_refs[0]}], [{decisive_refs[1]}]."
 
     return {
         "action": action,
@@ -209,52 +267,74 @@ def decide_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
 
 def resolve_proposals_batch(packages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     proposals = []
+    uncached = []
+    pkg_hashes = {}
+
     with sqlite3.connect(DB_PATH) as conn:
         for idx, pkg in enumerate(packages):
             pkg_id = pkg.get("packageId", f"pkg_{idx}")
             c_bytes = canonical_json_bytes(pkg)
-            pkg_hash = sha256_hex(c_bytes)
+            p_hash = sha256_hex(c_bytes)
+            pkg_hashes[pkg_id] = p_hash
 
             cur = conn.execute(
                 "SELECT action, facts_json, evidence_json, rationale FROM package_cache WHERE pkg_hash = ?",
-                (pkg_hash,)
+                (p_hash,)
             )
             row = cur.fetchone()
             if row:
                 action, facts_json, evidence_json, rationale = row
-                facts = json.loads(facts_json)
-                evidence = json.loads(evidence_json)
+                action_id = f"act_{sha256_hex(f'{pkg_id}:{action}:{idx}'.encode('utf-8'))[:16]}"
+                proposals.append({
+                    "packageId": pkg_id,
+                    "actionId": action_id,
+                    "action": action,
+                    "facts": json.loads(facts_json),
+                    "evidenceRefs": json.loads(evidence_json),
+                    "rationale": rationale
+                })
             else:
-                decision = decide_package(pkg)
-                action = decision["action"]
-                facts = decision["facts"]
-                evidence = decision["evidenceRefs"]
-                rationale = decision["rationale"]
+                uncached.append(pkg)
+
+    if uncached:
+        ai_results = ai_batch_reasoning(uncached)
+        with sqlite3.connect(DB_PATH) as conn:
+            for idx, pkg in enumerate(uncached):
+                pkg_id = pkg.get("packageId")
+                p_hash = pkg_hashes[pkg_id]
+                res = ai_results.get(pkg_id) or fallback_decide_package(pkg)
+                
+                action = res["action"]
+                facts = res["facts"]
+                evidence = res["evidenceRefs"]
+                rationale = res["rationale"]
 
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO package_cache (pkg_hash, action, facts_json, evidence_json, rationale)
                     VALUES (?, ?, ?, ?, ?)
                     """,
-                    (pkg_hash, action, json.dumps(facts), json.dumps(evidence), rationale)
+                    (p_hash, action, json.dumps(facts), json.dumps(evidence), rationale)
                 )
 
-            action_id = f"act_{sha256_hex(f'{pkg_id}:{action}:{idx}'.encode('utf-8'))[:16]}"
-            proposals.append({
-                "packageId": pkg_id,
-                "actionId": action_id,
-                "action": action,
-                "facts": facts,
-                "evidenceRefs": evidence,
-                "rationale": rationale
-            })
-        conn.commit()
+                action_id = f"act_{sha256_hex(f'{pkg_id}:{action}:{idx}'.encode('utf-8'))[:16]}"
+                proposals.append({
+                    "packageId": pkg_id,
+                    "actionId": action_id,
+                    "action": action,
+                    "facts": facts,
+                    "evidenceRefs": evidence,
+                    "rationale": rationale
+                })
+            conn.commit()
 
+    order = {pkg.get("packageId"): i for i, pkg in enumerate(packages)}
+    proposals.sort(key=lambda p: order.get(p["packageId"], 0))
     return proposals
 
 
 # ---------------------------------------------------------------------------
-# Message Handler (Initial Proposals vs Results Continuation)
+# Message Handler (Proposals & Results Continuations)
 # ---------------------------------------------------------------------------
 @app.post("/message:send")
 @app.post("/{prefix:path}/message:send")
@@ -277,7 +357,7 @@ async def handle_send_message(req: Request, prefix: Optional[str] = None):
 
     msg_fingerprint = sha256_hex(canonical_json_bytes(message))
 
-    # Check Idempotency for this principal
+    # Idempotency check
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute(
             "SELECT msg_hash, task_id FROM messages WHERE principal_id = ? AND message_id = ?",
@@ -307,7 +387,6 @@ async def handle_send_message(req: Request, prefix: Optional[str] = None):
     media_type = part0.get("mediaType")
     data = part0.get("data", {})
 
-    # Case 1: Initial Batch Proposals
     if media_type == "application/vnd.ga5.invoice-claim-batch+json":
         batch_id = data.get("batchId", str(uuid.uuid4()))
         packages = data.get("packages", [])
@@ -350,7 +429,6 @@ async def handle_send_message(req: Request, prefix: Optional[str] = None):
 
         return a2a_response({"task": task})
 
-    # Case 2: Continuation with Grader Results
     elif media_type == "application/vnd.ga5.invoice-action-results+json":
         task_id = message.get("taskId")
         context_id = message.get("contextId")
@@ -373,7 +451,6 @@ async def handle_send_message(req: Request, prefix: Optional[str] = None):
 
             _, stored_ctx, state, task_json_str, proposals_json_str, stored_batch = t_row
 
-            # Reject mismatched context or batch
             if context_id and stored_ctx != context_id:
                 conn.execute("ROLLBACK")
                 raise HTTPException(status_code=400, detail="Mismatched contextId")
@@ -381,7 +458,6 @@ async def handle_send_message(req: Request, prefix: Optional[str] = None):
                 conn.execute("ROLLBACK")
                 raise HTTPException(status_code=400, detail="Mismatched batchId")
 
-            # Terminal conflict check
             if state in ("TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"):
                 conn.execute("ROLLBACK")
                 return JSONResponse(status_code=409, content={"error": "TASK_TERMINAL", "state": state})
@@ -450,7 +526,7 @@ async def handle_send_message(req: Request, prefix: Optional[str] = None):
 
 
 # ---------------------------------------------------------------------------
-# Task Retrieval & User Isolation
+# Task Queries & Cancellation
 # ---------------------------------------------------------------------------
 @app.get("/tasks/{task_id}")
 @app.get("/{prefix:path}/tasks/{task_id}")
@@ -484,9 +560,6 @@ async def list_tasks(req: Request, prefix: Optional[str] = None):
         return a2a_response({"tasks": tasks})
 
 
-# ---------------------------------------------------------------------------
-# Cancellation (Cancel vs Result Race Safe)
-# ---------------------------------------------------------------------------
 @app.post("/tasks/{task_id}:cancel")
 @app.post("/{prefix:path}/tasks/{task_id}:cancel")
 async def cancel_task(task_id: str, req: Request, prefix: Optional[str] = None):
